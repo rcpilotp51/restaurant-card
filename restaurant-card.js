@@ -1,17 +1,21 @@
-/*  restaurant-card.js  — custom Lovelace card
+/*  restaurant-card.js  — custom Lovelace card (v1.1.0)
  *  Restaurant list with live Google Places data.
- *  - Stores restaurants in a Home Assistant todo list (default: todo.restaurants)
- *  - Tap a restaurant: expands to show open/closed, today's + weekly hours,
- *    driving distance/time, rating, address
- *  - Buttons: Website, Google Maps (live busyness), Remove
- *  - "+" button: search Google Places and add restaurants
  *
- *  Config:
+ *  Two modes, auto-detected:
+ *
+ *  INTEGRATION MODE (recommended) — if the "Restaurant Card" custom integration
+ *  (restaurant_card) is installed, the card uses its sensors and services.
+ *  The Google API key lives server-side; no key in the card config.
+ *    type: custom:restaurant-card
+ *
+ *  STANDALONE MODE — no integration installed; the card calls Google directly.
  *    type: custom:restaurant-card
  *    entity: todo.restaurants        # todo list that stores the restaurants
  *    api_key: YOUR_GOOGLE_KEY        # Places API (New) + Routes API enabled
+ *
+ *  Common options:
  *    title: Restaurants              # optional
- *    origin:                         # optional, defaults to HA home coords
+ *    origin:                         # optional (standalone only), defaults to HA home
  *      latitude: 40.0
  *      longitude: -75.0
  */
@@ -22,6 +26,7 @@
   const ROUTE_TTL = 60 * 60 * 1000;        // driving time freshness: 60 min
   const PLACES_BASE = "https://places.googleapis.com/v1";
   const ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes";
+  const INTEGRATION_DOMAIN = "restaurant_card";
 
   const DETAIL_MASK = [
     "id", "displayName", "formattedAddress", "location", "rating",
@@ -60,31 +65,49 @@
     constructor() {
       super();
       this.attachShadow({ mode: "open" });
-      this._items = [];          // todo items [{uid, summary, meta}]
-      this._details = {};        // placeId -> place details
-      this._routes = {};         // placeId -> {meters, seconds}
-      this._expanded = null;     // expanded placeId
+      this._items = [];
+      this._details = {};
+      this._routes = {};
+      this._expanded = null;
       this._searchOpen = false;
       this._searchResults = null;
       this._searchBusy = false;
       this._error = null;
       this._lastTodoState = null;
+      this._lastIntegFingerprint = null;
       this._rendered = false;
+      this._integration = false;
     }
 
     setConfig(config) {
-      if (!config.entity) throw new Error("restaurant-card: 'entity' (a todo list) is required");
       this._config = { title: "Restaurants", ...config };
     }
 
     static getStubConfig() {
-      return { entity: "todo.restaurants", api_key: "" };
+      return {};
     }
 
     getCardSize() { return Math.max(3, this._items.length + 1); }
 
     set hass(hass) {
       this._hass = hass;
+      this._integration = !!(hass.services && hass.services[INTEGRATION_DOMAIN]);
+
+      if (this._integration) {
+        const entities = this._integrationEntities();
+        const fp = entities.map((s) => s.entity_id + "|" + s.last_updated).join(";");
+        if (fp !== this._lastIntegFingerprint || !this._rendered) {
+          this._lastIntegFingerprint = fp;
+          this._syncFromIntegration(entities);
+          this._render();
+        }
+        return;
+      }
+
+      if (!this._config.entity) {
+        if (!this._rendered) { this._error = "Install the Restaurant Card integration, or set 'entity' and 'api_key' for standalone mode."; this._render(); }
+        return;
+      }
       const st = hass.states[this._config.entity];
       const stVal = st ? `${st.state}|${st.last_updated}` : "missing";
       if (stVal !== this._lastTodoState) {
@@ -94,6 +117,49 @@
         this._render();
       }
     }
+
+    /* ---------- integration mode ---------- */
+
+    _integrationEntities() {
+      return Object.values(this._hass.states).filter(
+        (s) => s.attributes && s.attributes.restaurant_card_place_id
+      );
+    }
+
+    _syncFromIntegration(entities) {
+      this._items = [];
+      this._details = {};
+      this._routes = {};
+      for (const st of entities) {
+        const a = st.attributes;
+        const pid = a.restaurant_card_place_id;
+        this._items.push({
+          uid: pid,
+          summary: a.friendly_name || pid,
+          meta: { place_id: pid, address: a.address, latitude: a.latitude, longitude: a.longitude },
+        });
+        this._details[pid] = {
+          rating: a.rating,
+          userRatingCount: a.rating_count,
+          formattedAddress: a.address,
+          websiteUri: a.website,
+          googleMapsUri: a.maps_url,
+          _error: a.error || undefined,
+          currentOpeningHours: {
+            openNow: st.state === "open" ? true : st.state === "closed" ? false : null,
+            weekdayDescriptions: a.hours,
+            nextCloseTime: a.next_close_time,
+            nextOpenTime: a.next_open_time,
+          },
+        };
+        if (a.distance_meters != null) {
+          this._routes[pid] = { meters: a.distance_meters, seconds: a.duration_seconds || 0 };
+        }
+      }
+      this._items.sort((x, y) => x.summary.localeCompare(y.summary));
+    }
+
+    /* ---------- shared helpers ---------- */
 
     get _origin() {
       const o = this._config.origin;
@@ -108,7 +174,7 @@
       return (this._hass?.config?.unit_system?.length || "mi") === "mi";
     }
 
-    /* ---------- data ---------- */
+    /* ---------- standalone mode data ---------- */
 
     async _loadItems() {
       try {
@@ -199,26 +265,45 @@
       } catch (e) { /* distance is non-critical */ }
     }
 
+    /* ---------- search / add / remove (both modes) ---------- */
+
     async _search(query) {
       this._searchBusy = true;
       this._render();
       try {
-        const r = await fetch(`${PLACES_BASE}/places:searchText`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Goog-Api-Key": this._config.api_key,
-            "X-Goog-FieldMask":
-              "places.id,places.displayName,places.formattedAddress,places.location",
-          },
-          body: JSON.stringify({
-            textQuery: query,
-            locationBias: { circle: { center: this._origin, radius: 40000 } },
-          }),
-        });
-        if (!r.ok) throw new Error(`Search failed (${r.status}): ${(await r.text()).slice(0, 160)}`);
-        const data = await r.json();
-        this._searchResults = (data.places || []).slice(0, 6);
+        if (this._integration) {
+          const resp = await this._hass.connection.sendMessagePromise({
+            type: "call_service",
+            domain: INTEGRATION_DOMAIN,
+            service: "search_places",
+            service_data: { query },
+            return_response: true,
+          });
+          const results = (resp?.response?.results) || [];
+          this._searchResults = results.map((r) => ({
+            id: r.place_id,
+            displayName: { text: r.name },
+            formattedAddress: r.address,
+            location: { latitude: r.latitude, longitude: r.longitude },
+          }));
+        } else {
+          const r = await fetch(`${PLACES_BASE}/places:searchText`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Goog-Api-Key": this._config.api_key,
+              "X-Goog-FieldMask":
+                "places.id,places.displayName,places.formattedAddress,places.location",
+            },
+            body: JSON.stringify({
+              textQuery: query,
+              locationBias: { circle: { center: this._origin, radius: 40000 } },
+            }),
+          });
+          if (!r.ok) throw new Error(`Search failed (${r.status}): ${(await r.text()).slice(0, 160)}`);
+          const data = await r.json();
+          this._searchResults = (data.places || []).slice(0, 6);
+        }
         this._error = null;
       } catch (e) {
         this._error = String(e.message || e);
@@ -229,26 +314,43 @@
     }
 
     async _addPlace(place) {
-      const meta = {
-        place_id: place.id,
-        address: place.formattedAddress,
-        latitude: place.location?.latitude,
-        longitude: place.location?.longitude,
-      };
-      await this._hass.callService("todo", "add_item", {
-        entity_id: this._config.entity,
-        item: place.displayName?.text || "Restaurant",
-        description: JSON.stringify(meta),
-      });
+      if (this._integration) {
+        await this._hass.callService(INTEGRATION_DOMAIN, "add_restaurant", {
+          place_id: place.id,
+          name: place.displayName?.text,
+          address: place.formattedAddress,
+          latitude: place.location?.latitude,
+          longitude: place.location?.longitude,
+        });
+      } else {
+        const meta = {
+          place_id: place.id,
+          address: place.formattedAddress,
+          latitude: place.location?.latitude,
+          longitude: place.location?.longitude,
+        };
+        await this._hass.callService("todo", "add_item", {
+          entity_id: this._config.entity,
+          item: place.displayName?.text || "Restaurant",
+          description: JSON.stringify(meta),
+        });
+      }
       this._searchOpen = false;
       this._searchResults = null;
+      this._render();
     }
 
     async _removePlace(item) {
-      await this._hass.callService("todo", "remove_item", {
-        entity_id: this._config.entity,
-        item: item.uid,
-      });
+      if (this._integration) {
+        await this._hass.callService(INTEGRATION_DOMAIN, "remove_restaurant", {
+          place_id: item.meta.place_id,
+        });
+      } else {
+        await this._hass.callService("todo", "remove_item", {
+          entity_id: this._config.entity,
+          item: item.uid,
+        });
+      }
     }
 
     /* ---------- rendering ---------- */
@@ -268,12 +370,12 @@
 
     _distanceText(placeId) {
       const rt = this._routes[placeId];
-      if (!rt) return "";
+      if (!rt || rt.meters == null) return "";
       const dist = this._useMiles
         ? `${(rt.meters / 1609.34).toFixed(1)} mi`
         : `${(rt.meters / 1000).toFixed(1)} km`;
-      const mins = Math.round(rt.seconds / 60);
-      return `${dist} · ${mins} min drive`;
+      const mins = Math.round((rt.seconds || 0) / 60);
+      return mins ? `${dist} · ${mins} min drive` : dist;
     }
 
     _hoursHtml(d) {
@@ -330,7 +432,7 @@
     _render() {
       if (!this._hass || !this._config) return;
       this._rendered = true;
-      const noKey = !this._config.api_key;
+      const needsKey = !this._integration && !this._config.api_key;
 
       let search = "";
       if (this._searchOpen) {
@@ -404,7 +506,7 @@
             <div class="title">${escapeHtml(this._config.title)}</div>
             <button class="addbtn" data-act="opensearch" title="Add restaurant">＋</button>
           </div>
-          ${noKey ? `<div class="warn">Set <code>api_key</code> in the card config to enable live data.</div>` : ""}
+          ${needsKey ? `<div class="warn">Install the Restaurant Card integration (recommended), or set <code>api_key</code> in the card config for standalone mode.</div>` : ""}
           ${this._error ? `<div class="err">${escapeHtml(this._error)}</div>` : ""}
           ${search}
           <div class="list">${rows}</div>
@@ -439,7 +541,7 @@
         if (place) this._addPlace(place);
       } else if (act === "toggle") {
         this._expanded = this._expanded === pid ? null : pid;
-        if (this._expanded) {
+        if (this._expanded && !this._integration) {
           const item = this._items.find((i) => i.meta.place_id === pid);
           this._fetchDetails(pid);
           if (item) this._fetchRoute(pid, item.meta);
@@ -470,5 +572,5 @@
       description: "Restaurant list with live Google Places data: open status, hours, driving distance, website & busyness links.",
     });
   }
-  console.info("%c RESTAURANT-CARD %c v1.0.0 ", "background:#3d9142;color:#fff", "background:#555;color:#fff");
+  console.info("%c RESTAURANT-CARD %c v1.1.0 ", "background:#3d9142;color:#fff", "background:#555;color:#fff");
 })();

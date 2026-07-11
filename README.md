@@ -17,7 +17,17 @@ A custom Lovelace card for Home Assistant that keeps a list of your favorite res
 - Restaurant list is stored in a Home Assistant **to-do list entity**, so it syncs across every device and dashboard
 - API responses are cached in the browser (15 min for open status, 60 min for drive times) to keep API usage well inside Google's free tier
 
-## Prerequisites
+## Two modes
+
+**Integration mode (recommended):** install the companion [Restaurant Card integration](https://github.com/rcpilotp51/restaurant-card-integration) (HACS → Integration). Your Google API key is entered once in Settings and stays server-side. The card auto-detects it and needs zero configuration:
+
+```yaml
+type: custom:restaurant-card
+```
+
+**Standalone mode:** no integration; the card calls Google directly from the browser using an `api_key` in the card config. Follow the prerequisites below.
+
+## Prerequisites (standalone mode)
 
 1. **A Google Maps Platform API key** with these two APIs enabled:
    - [Places API (New)](https://console.cloud.google.com/apis/library/places.googleapis.com)
