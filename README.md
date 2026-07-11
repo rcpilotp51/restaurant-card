@@ -26,6 +26,7 @@ A custom Lovelace card for Home Assistant that keeps a list of your favorite res
    **Restrict the key** (strongly recommended, since it is visible in your dashboard config):
    - Application restrictions → *Websites* → add every origin you use to open Home Assistant, e.g.:
      - `http://homeassistant.local:8123/*`
+     - `http://YOUR-IP:8123/*` (e.g. `http://192.168.1.50:8123/*`, if you access HA by IP address)
      - `https://YOUR-INSTANCE.ui.nabu.casa/*` (if you use Home Assistant Cloud)
    - API restrictions → limit the key to *Places API (New)* and *Routes API*
 
